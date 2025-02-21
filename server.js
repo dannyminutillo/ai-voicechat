@@ -6,7 +6,7 @@ const { GoogleAuth } = require('google-auth-library');
 const speech = require('@google-cloud/speech');
 const textToSpeech = require('@google-cloud/text-to-speech');
 const fs = require('fs');
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
 require('dotenv').config();
 
 // 🔥 Ensure Google Cloud Credentials Path is Set
@@ -44,9 +44,6 @@ app.post('/voice-response', (req, res) => {
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.say("Hello! Welcome to Biltmore Hair Restoration. How can I assist you today?");
     
-    // ⏸️ Prevent Twilio from hanging up too early
-    twiml.pause({ length: 5 });
-
     twiml.connect().stream({
         url: `wss://${SERVER_URL.replace(/^https?:\/\//, '')}/ws`,
         track: "inbound_track"
@@ -87,29 +84,27 @@ wss.on('connection', (ws) => {
                 const aiResponse = await getAIResponse(transcript);
                 console.log(`🤖 AI Response: ${aiResponse}`);
 
-                const audioPath = await synthesizeSpeech(aiResponse);
-                console.log(`🎧 AI Audio Response Generated: ${audioPath}`);
-
-                const audioData = fs.readFileSync(audioPath);
-                // WAV files have a 44-byte header. Strip it before sending.
-                const rawAudioData = audioData.slice(44);  
-
+                // Generate clean MULAW audio
+                const rawAudioData = await synthesizeSpeech(aiResponse);
                 console.log(`📤 Sending ${rawAudioData.length} bytes of clean MULAW audio to Twilio`);
+                
+                // ✅ Send only the raw MULAW data (No Headers)
                 ws.send(rawAudioData);
             }
         });
 
     ws.on('message', (message) => {
         console.log(`🔊 Received ${message.length} bytes of audio from Twilio`);
-
-        // Save raw audio data for debugging
-        fs.appendFileSync(`twilio-audio.raw`, message);
-
-        if (message.length < 100) {
+    
+        // Save raw data for debugging (but make sure it's actually RAW!)
+        const cleanAudio = message.slice(); // Ensure no extra headers
+        fs.appendFileSync(`twilio-audio.raw`, cleanAudio);
+    
+        if (cleanAudio.length < 100) {
             console.warn("⚠️ Warning: Audio data from Twilio is very small. Might be silent.");
         }
-
-        recognizeStream.write(message);
+    
+        recognizeStream.write(cleanAudio);
     });
 
     ws.on('close', () => {
@@ -160,19 +155,34 @@ async function getAIResponse(text) {
     }
 }
 
-// 🎙️ Convert AI Response to Speech (Google TTS)
+// 🎙️ Convert AI Response to Speech (Google TTS) & Encode to MULAW
 async function synthesizeSpeech(text) {
     const ttsClient = new textToSpeech.TextToSpeechClient();
     const request = {
         input: { text },
         voice: { languageCode: "en-US", ssmlGender: "NEUTRAL" },
-        audioConfig: { audioEncoding: "LINEAR16" },
+        audioConfig: { audioEncoding: "LINEAR16", sampleRateHertz: 8000 },
     };
 
     const [response] = await ttsClient.synthesizeSpeech(request);
-    const filePath = `output.mp3`;
-    fs.writeFileSync(filePath, response.audioContent, 'binary');
-    return filePath;
+    const wavFilePath = `output.wav`;
+    fs.writeFileSync(wavFilePath, response.audioContent, 'binary');
+
+    // Convert WAV to MULAW for Twilio
+    return await convertToMULAW(wavFilePath);
+}
+
+// 🎼 Convert WAV to MULAW for Twilio (No Headers)
+async function convertToMULAW(inputPath) {
+    return new Promise((resolve, reject) => {
+        exec(`ffmpeg -i ${inputPath} -ar 8000 -ac 1 -f mulaw -bitexact -y output.mulaw`, (err) => {
+            if (err) return reject(err);
+            
+            // Read the clean MULAW data (no headers)
+            const rawAudioData = fs.readFileSync('output.mulaw');
+            resolve(rawAudioData);
+        });
+    });
 }
 
 // ✅ Start Server
